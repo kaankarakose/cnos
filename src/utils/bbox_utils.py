@@ -90,9 +90,12 @@ class CropResizePad:
     def __init__(self, target_size, pad_value=0.0):
         if isinstance(target_size, int):
             target_size = (target_size, target_size)
-        self.target_size = target_size
-        self.target_ratio = self.target_size[1] / self.target_size[0]
-        self.target_h, self.target_w = target_size
+            
+        # Ensure target size is divisible by 14
+        self.target_h = (target_size[0] // 14) * 14
+        self.target_w = (target_size[1] // 14) * 14
+        self.target_size = (self.target_h, self.target_w)
+        self.target_ratio = self.target_w / self.target_h
         self.target_max = max(self.target_h, self.target_w)
         self.pad_value = pad_value
 
@@ -100,30 +103,45 @@ class CropResizePad:
         box_sizes = boxes[:, 2:] - boxes[:, :2]
         scale_factor = self.target_max / torch.max(box_sizes, dim=-1)[0]
         processed_images = []
+        
         for image, box, scale in zip(images, boxes, scale_factor):
-            # crop and scale
+            # Crop and scale
             image = image[:, box[1] : box[3], box[0] : box[2]]
-            image = F.interpolate(image.unsqueeze(0), scale_factor=scale.item())[0]
-            # pad and resize
-            original_h, original_w = image.shape[1:]
-            original_ratio = original_w / original_h
-
-            # check if the original and final aspect ratios are the same within a margin
-            if self.target_ratio != original_ratio:
-                padding_top = max((self.target_h - original_h) // 2, 0)
-                padding_bottom = self.target_h - original_h - padding_top
-                padding_left = max((self.target_w - original_w) // 2, 0)
-                padding_right = self.target_w - original_w - padding_left
-                image = F.pad(
-                    image, (padding_left, padding_right, padding_top, padding_bottom), value=self.pad_value
-                )
-            assert image.shape[1] == image.shape[2], logging.info(
-                f"image {image.shape} is not square after padding"
+            
+            # Use resize to exact dimensions instead of scale_factor
+            # This prevents floating point rounding issues
+            h, w = image.shape[1:]
+            new_h = int(h * scale.item())
+            new_w = int(w * scale.item())
+            
+            # Ensure new dimensions are divisible by 14
+            new_h = (new_h // 14) * 14
+            new_w = (new_w // 14) * 14
+            
+            # Resize to new dimensions
+            image = F.interpolate(image.unsqueeze(0), size=(new_h, new_w), mode='bilinear', align_corners=False)[0]
+            
+            # Pad to target size directly (instead of calculating padding amounts)
+            pad_h = self.target_h - new_h
+            pad_w = self.target_w - new_w
+            padding_top = pad_h // 2
+            padding_bottom = pad_h - padding_top
+            padding_left = pad_w // 2
+            padding_right = pad_w - padding_left
+            
+            # Apply padding
+            image = F.pad(
+                image, (padding_left, padding_right, padding_top, padding_bottom), value=self.pad_value
             )
-            image = F.interpolate(
-                image.unsqueeze(0), scale_factor=self.target_h / image.shape[1]
-            )[0]
+            
+            # Verify image dimensions
+            assert (image.shape[1] == self.target_h and image.shape[2] == self.target_w), logging.info(
+                f"image {image.shape} does not match target size {self.target_size} after processing"
+            )
+            
+            # No need for final resize 
             processed_images.append(image)
+            
         return torch.stack(processed_images)
 
 
