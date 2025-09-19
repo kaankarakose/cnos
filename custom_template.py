@@ -45,7 +45,7 @@ if __name__ == "__main__":
     cad_folder = '/nas/project_data/B1_Behavior/rush/ados-objects/object_pose_mega/rtdt/cnos/cnos/ados_objects'
     object_names = [name for name in os.listdir(cad_folder) if os.path.isdir(os.path.join(cad_folder, name))]
     cad_folders = [os.path.join(cad_folder, folder) for folder in object_names]
-    output_dir = '/nas/project_data/B1_Behavior/rush/ados-objects/object_pose_mega/rtdt/cnos/cnos/rendered_objects'
+    output_dir = '/nas/project_data/B1_Behavior/rush/kaan/first_play_local/data/rendered_objects'
     for object_name, cad_folder_path in zip(object_names, cad_folders):
         # Find the .ply file in the object folder
         ply_files = glob.glob(os.path.join(cad_folder_path, "*.ply"))
