@@ -143,12 +143,17 @@ class Detections:
 
     def to_numpy(self):
         for key in self.keys:
-            setattr(self, key, getattr(self, key).cpu().numpy())
+            attr = getattr(self, key)
+            # Skip non-tensor attributes (like 'keys' list)
+            if torch.is_tensor(attr):
+                setattr(self, key, attr.cpu().numpy())
 
     def to_torch(self):
         for key in self.keys:
-            a = getattr(self, key)
-            setattr(self, key, torch.from_numpy(getattr(self, key)))
+            attr = getattr(self, key)
+            # Skip non-array attributes (like 'keys' list)
+            if isinstance(attr, np.ndarray):
+                setattr(self, key, torch.from_numpy(attr))
 
     def save_to_file(
         self, scene_id, frame_id, runtime, file_path, dataset_name, return_results=False, save_mask=True, save_score_distribution=False
@@ -193,7 +198,10 @@ class Detections:
 
     def filter(self, idxs):
         for key in self.keys:
-            setattr(self, key, getattr(self, key)[idxs])
+            attr = getattr(self, key)
+            # Skip non-indexable attributes (like 'keys' list)
+            if isinstance(attr, (torch.Tensor, np.ndarray)):
+                setattr(self, key, attr[idxs])
 
     def clone(self):
         """

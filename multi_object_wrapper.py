@@ -8,6 +8,7 @@ from PIL import Image
 import logging
 import os.path as osp
 from hydra import initialize, compose
+from hydra.core.global_hydra import GlobalHydra
 # set level logging
 logging.basicConfig(level=logging.INFO)
 import numpy as np
@@ -106,6 +107,10 @@ def visualize(rgb, detections, object_names=None, save_path=None):
     
     # Visualize all masks
     for idx, (mask, obj_id) in enumerate(zip(all_masks, all_object_ids)):
+        # Normalize mask to 2D - SAM sometimes returns (1, 1, H, W) for single detections
+        while mask.ndim > 2:
+            mask = mask.squeeze(0) if hasattr(mask, 'squeeze') else np.squeeze(mask, 0)
+        
         # Convert mask to boolean mask
         mask = mask > 0.5
         
@@ -180,7 +185,8 @@ class MultiObjectInferenceWrapper:
                  gpu_id=0,
                  session_name=None,
                  camera_view=None,
-                 frame_type=None):
+                 frame_type=None,
+                 sam_checkpoint_dir=None):
         """
         Initialize the MultiObjectInferenceWrapper.
         
@@ -207,9 +213,13 @@ class MultiObjectInferenceWrapper:
             logging.info(f"Using GPU: {gpu_id} ({torch.cuda.get_device_name(gpu_id)})")
         
         # Initialize model
+        # Clear any existing Hydra instance to avoid re-initialization errors
+        GlobalHydra.instance().clear()
         with initialize(version_base=None, config_path="./configs"):
-            self.cfg = compose(config_name='run_inference.yaml')
-        
+            overrides = []
+            if sam_checkpoint_dir:
+                overrides.append(f"model.segmentor_model.sam.checkpoint_dir={sam_checkpoint_dir}")
+            self.cfg = compose(config_name='run_inference.yaml', overrides=overrides)
         # Initialize similarity metric
         self.metric = Similarity()
         
@@ -232,6 +242,9 @@ class MultiObjectInferenceWrapper:
         
         #logging.info(f"Moving models to {self.device} (GPU {gpu_id}) done!")
         
+        # Log model parameters summary
+        self._log_model_summary()
+        
         # Initialize processor for templates
         processing_config = OmegaConf.create(
             {
@@ -244,6 +257,50 @@ class MultiObjectInferenceWrapper:
         self.ref_feats_dict = {}
         self.object_names = []
         self.scores_dict = {}
+    
+    def _log_model_summary(self):
+        """Log a summary of model parameters and configuration."""
+        def count_parameters(model):
+            """Count trainable and total parameters."""
+            total = sum(p.numel() for p in model.parameters())
+            trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            return total, trainable
+        
+        logging.info("=" * 60)
+        logging.info("CNOS Model Parameters Summary")
+        logging.info("=" * 60)
+        
+        # Descriptor model (DINOv2)
+        if hasattr(self.model, 'descriptor_model') and hasattr(self.model.descriptor_model, 'model'):
+            total, trainable = count_parameters(self.model.descriptor_model.model)
+            logging.info(f"Descriptor Model (DINOv2):")
+            logging.info(f"  - Total params:     {total:,}")
+            logging.info(f"  - Trainable params: {trainable:,}")
+            logging.info(f"  - Device: {self.model.descriptor_model.model.device}")
+        
+        # Segmentor model (SAM)
+        if hasattr(self.model, 'segmentor_model'):
+            if hasattr(self.model.segmentor_model, 'predictor') and hasattr(self.model.segmentor_model.predictor, 'model'):
+                total, trainable = count_parameters(self.model.segmentor_model.predictor.model)
+                logging.info(f"Segmentor Model (SAM):")
+                logging.info(f"  - Total params:     {total:,}")
+                logging.info(f"  - Trainable params: {trainable:,}")
+            elif hasattr(self.model.segmentor_model, 'model'):
+                total, trainable = count_parameters(self.model.segmentor_model.model)
+                logging.info(f"Segmentor Model:")
+                logging.info(f"  - Total params:     {total:,}")
+                logging.info(f"  - Trainable params: {trainable:,}")
+        
+        # Configuration summary
+        logging.info(f"Configuration:")
+        logging.info(f"  - Confidence threshold: {self.conf_threshold}")
+        logging.info(f"  - Device: {self.device}")
+        logging.info(f"  - GPU ID: {self.gpu_id}")
+        if hasattr(self.cfg, 'model') and hasattr(self.cfg.model, 'segmentor_model'):
+            sam_cfg = self.cfg.model.segmentor_model.get('sam', {})
+            if sam_cfg:
+                logging.info(f"  - SAM checkpoint: {sam_cfg.get('checkpoint_dir', 'default')}")
+        logging.info("=" * 60)
         
     def load_templates(self, template_paths_dict):
         """
@@ -319,12 +376,12 @@ class MultiObjectInferenceWrapper:
                 #logging.info(f"descriptors shape={descriptors.shape}, device={descriptors.device}")
                 
                 if descriptors.numel() == 0:
-                    logging.warning(f"Empty descriptors tensor for {object_name}")
+                    #logging.warning(f"Empty descriptors tensor for {object_name}")
                     all_detections[object_name] = None
                     continue
                     
                 if ref_feats.numel() == 0:
-                    logging.warning(f"Empty reference features for {object_name}")
+                    #logging.warning(f"Empty reference features for {object_name}")
                     all_detections[object_name] = None
                     continue
                 
@@ -358,7 +415,7 @@ class MultiObjectInferenceWrapper:
                     #logging.info(f"Score_per_detection has {num_elements} elements")
                     
                     if num_elements == 0:
-                        logging.warning(f"Empty score_per_detection tensor for {object_name}")
+                        #logging.warning(f"Empty score_per_detection tensor for {object_name}")
                         all_detections[object_name] = None
                         continue
                     
@@ -421,14 +478,24 @@ class MultiObjectInferenceWrapper:
                     obj_detections.filter(index)
                     #logging.info(f"Successfully filtered detections with index")
                 except Exception as e:
-                    logging.error(f"Error in first filter operation: {str(e)}")
+                    #logging.error(f"Error in first filter operation: {str(e)}")
                     # Add detailed debug info
-                    #logging.error(f"Index shape: {index.shape}, device: {index.device}, dtype: {index.dtype}")
+                    #logging.error(f"Index info: shape={index.shape}, device={index.device}, dtype={index.dtype}")
+                    #logging.error(f"Index values: {index}")
                     # Check all attributes of obj_detections and log their devices
-                    for key in obj_detections.keys:
-                        attr = getattr(obj_detections, key)
-                        #if attr is not None and torch.is_tensor(attr) and hasattr(attr, 'device'):
-                            #logging.error(f"Attribute '{key}' device: {attr.device}, shape: {attr.shape}, dtype: {attr.dtype}")
+                    #for key in obj_detections.keys:
+                    #    attr = getattr(obj_detections, key)
+                        # if attr is not None:
+                        #     if torch.is_tensor(attr):
+                        #         logging.error(f"Attribute '{key}': tensor, device={attr.device}, shape={attr.shape}, dtype={attr.dtype}")
+                        #     elif isinstance(attr, np.ndarray):
+                        #         logging.error(f"Attribute '{key}': numpy, shape={attr.shape}, dtype={attr.dtype}")
+                        #     else:
+                        #         logging.error(f"Attribute '{key}': type={type(attr)}")
+                    # for key in obj_detections.keys:
+                    #     attr = getattr(obj_detections, key)
+                    #     if attr is not None and torch.is_tensor(attr) and hasattr(attr, 'device'):
+                    #         logging.error(f"Attribute '{key}' device: {attr.device}, shape: {attr.shape}, dtype: {attr.dtype}")
                     all_detections[object_name] = None
                     continue
                     
@@ -547,7 +614,7 @@ class MultiObjectInferenceWrapper:
                         vis_output = os.path.join(base_dir, 'frames')
                         try:
                             os.makedirs(vis_output, exist_ok=True)
-                            logging.info(f"Created visualization directory: {vis_output}")
+                            #logging.info(f"Created visualization directory: {vis_output}")
                             
                             # Visualize combined results only once
                             if any(all_detections.values()):
@@ -569,12 +636,12 @@ class MultiObjectInferenceWrapper:
                         # Save masks
                         self.save_masks(detections, object_name, frame_name, session_name, camera_view, frame_type)
                         # Save bounding boxes
-                        self.save_bbox(detections, object_name, frame_name, session_name, camera_view, frame_type)
+                        #self.save_bbox(detections, object_name, frame_name, session_name, camera_view, frame_type)
                         # Save scores
-                        if object_name in self.scores_dict and self.scores_dict[object_name] is not None:
-                            self.save_scores(self.scores_dict[object_name], object_name, frame_name, session_name, camera_view, frame_type)
-                        else:
-                            logging.warning(f"No scores to save for {object_name}")
+                        # if object_name in self.scores_dict and self.scores_dict[object_name] is not None:
+                        #     self.save_scores(self.scores_dict[object_name], object_name, frame_name, session_name, camera_view, frame_type)
+                        # else:
+                        #     logging.warning(f"No scores to save for {object_name}")
                             
                         # Mark that at least one object was processed
                         any_object_processed = True
@@ -631,6 +698,25 @@ class MultiObjectInferenceWrapper:
         except AttributeError as e:
             raise ValueError(f"Cannot retrieve masks or scores for {object_name}: {str(e)}")
         
+        # Validate masks shape - should be (N, H, W) where N is number of masks
+        if masks is None or len(masks) == 0:
+            logging.warning(f"No masks to save for {object_name}")
+            return True
+        
+        # Convert to numpy if tensor
+        if torch.is_tensor(masks):
+            masks = masks.cpu().numpy()
+        if torch.is_tensor(scores):
+            scores = scores.cpu().numpy()
+        
+        # Handle different mask shapes - normalize to (N, H, W)
+        # SAM sometimes returns (1, 1, H, W) for single detections
+        while masks.ndim > 3:
+            masks = masks.squeeze(0)
+        if masks.ndim == 2:
+            # Single mask without batch dimension
+            masks = masks[np.newaxis, ...]
+        
         # Ensure we have all required components
         if not (session_name and camera_view and frame_type):
             logging.warning(f"Missing session info: session={session_name}, camera={camera_view}, frame_type={frame_type}")
@@ -644,12 +730,12 @@ class MultiObjectInferenceWrapper:
             camera_view in output_parts and 
             frame_type in output_parts):
             # Path already contains structure
-            output_dir = os.path.join(self.output_dir, object_name, 'masks', frame_info)
+            output_dir = os.path.join(self.output_dir, object_name, 'masks')#, frame_info)
         else:
             # Add full path structure
-            output_dir = os.path.join(self.output_dir, session_name, camera_view, frame_type, object_name, 'masks', frame_info)
+            output_dir = os.path.join(self.output_dir, session_name, camera_view, frame_type, object_name, 'masks')#, frame_info)
         
-        logging.info(f"Saving masks to: {output_dir}")
+        #logging.info(f"Saving masks to: {output_dir}")
         
         try:
             os.makedirs(output_dir, exist_ok=True)
@@ -658,23 +744,29 @@ class MultiObjectInferenceWrapper:
         
         # Dictionary to store all masks with their scores
         masks_data = {}
-        saved_files = []
+        #saved_files = []
         
         try:
-            for i, mask in enumerate(masks):
+            # Only save top 3 masks (highest confidence detections)
+            max_masks = min(3, len(masks))
+            for i, mask in enumerate(masks[:max_masks]):
+                # Threshold mask to binary before RLE encoding
+                # This ensures consistent encoding/decoding
+                binary_mask = (mask > 0.5).astype(np.uint8)
+                
                 # Convert mask to RLE format
-                rle = mask_to_rle(mask)
+                rle = mask_to_rle(binary_mask)
                 
-                # Save individual RLE to a file
-                rle_path = f"{output_dir}/mask_{i}.rle"
-                with open(rle_path, 'w') as f:
-                    json.dump({
-                        'counts': rle['counts'],
-                        'size': rle['size'],
-                        'score': float(scores[i])
-                    }, f, cls=NumpyEncoder)
+                # # Save individual RLE to a file
+                # rle_path = f"{output_dir}/mask_{i}.rle"
+                # with open(rle_path, 'w') as f:
+                #     json.dump({
+                #         'counts': rle['counts'],
+                #         'size': rle['size'],
+                #         'score': float(scores[i])
+                #     }, f, cls=NumpyEncoder)
                 
-                saved_files.append(rle_path)
+                # saved_files.append(rle_path)
                 
                 # Add to the combined dictionary
                 masks_data[f"mask_{i}"] = {
@@ -683,18 +775,18 @@ class MultiObjectInferenceWrapper:
                 }
             
             # Save all masks in a single JSON file
-            all_masks_path = f"{output_dir}/all_masks.json"
+            all_masks_path = f"{output_dir}/{frame_info}_masks.json"
             with open(all_masks_path, 'w') as f:
                 json.dump(masks_data, f, cls=NumpyEncoder)
                 
-            saved_files.append(all_masks_path)
+            #saved_files.append(all_masks_path)
             
-            # Verify files were saved correctly
-            for file_path in saved_files:
-                if not os.path.exists(file_path) or os.path.getsize(file_path) == 0:
-                    raise IOError(f"Mask file was not saved properly: {file_path}")
+            # # Verify files were saved correctly
+            # for file_path in saved_files:
+            #     if not os.path.exists(file_path) or os.path.getsize(file_path) == 0:
+            #         raise IOError(f"Mask file was not saved properly: {file_path}")
                     
-            logging.info(f"Successfully saved {len(masks)} masks for {object_name} in {output_dir}")
+            #logging.info(f"Successfully saved {len(masks)} masks for {object_name} in {output_dir}")
             return True
             
         except Exception as e:
